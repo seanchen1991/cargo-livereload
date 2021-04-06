@@ -1,17 +1,60 @@
+extern crate notify;
+
 use structopt::StructOpt;
 
-use std::io::Write;
+use notify::{Watcher, RecursiveMode, RawEvent, raw_watcher};
+use std::sync::mpsc::channel;
 use tokio::sync::mpsc;
 
-use log::LevelFilter;
+use std::io::Write;
 use chrono::Local;
 use env_logger::Builder;
-use notify::{Watcher, RecommendedWatcher, RecursiveMode, Result};
+use log::LevelFilter;
 
 #[derive(StructOpt)]
 struct Cli {
     #[structopt(parse(from_os_str))]
     file_path: Option<std::path::PathBuf>,
+}
+
+enum FileChangeOperation {
+    Chmod = 1,
+    CloseWrite,
+    Create,
+    Remove,
+    Rename,
+    Rescan,
+    Write,
+    Unknown,
+}
+
+struct FileChange {
+    path: String,
+    operation: FileChangeOperation,
+}
+
+impl From<notify::Op> for FileChangeOperation {
+    fn from(source: notify::Op) -> FileChangeOperation {
+        match source {
+            notify::Op::CHMOD => FileChangeOperation::Chmod,
+            notify::Op::CLOSE_WRITE	=> FileChangeOperation::CloseWrite,
+            notify::Op::CREATE => FileChangeOperation::Create,
+            notify::Op::REMOVE => FileChangeOperation::Remove,
+            notify::Op::RENAME => FileChangeOperation::Rename,
+            notify::Op::RESCAN => FileChangeOperation::Rescan,
+            notify::Op::WRITE => FileChangeOperation::Write,
+            _ => FileChangeOperation::Unknown,
+        }
+    }
+}
+
+impl FileChange {
+    fn new(op: notify::Op, path: String) -> Self {
+        FileChange{
+            path,
+            operation: FileChangeOperation::from(op),
+        }
+    }
 }
 
 #[tokio::main]
@@ -36,17 +79,27 @@ pub async fn main() {
     };
 
     let (tx, mut rx) = mpsc::channel(32);
-    
+
     tokio::spawn(async move {
-        let mut watcher: RecommendedWatcher = Watcher::new_immediate(|res| {
-            match res {
-                Ok(event) => println!("event: {:?}", event),
-                Err(e) => println!("watch error: {:?}", e),
-            }
-        })?;
+        let (watcher_tx, watcher_rx) = channel();
+        let mut watcher = raw_watcher(watcher_tx).unwrap();
+        watcher.watch(file_path, RecursiveMode::Recursive).unwrap();
+        log::info!("File watcher started...");
 
-        watcher.watch(".", RecursiveMode::Recursive)?;
-    })
+        loop {
+            let msg = match watcher_rx.recv() {
+               Ok(RawEvent{path: Some(path), op: Ok(op), cookie}) => {
+                    // Ok(FileChange{path: path.to_string(), operation: 
+                   format!("{:?} {:?} ({:?})", op, path, cookie)
+               },
+               Ok(event) => format!("broken event: {:?}", event),
+               Err(e) => format!("watch error: {:?}", e),
+            };
+            tx.send(msg).await;
+        }
+    });
 
-    Ok(())
+    while let Some(message) = rx.recv().await {
+        log::info!("Got = {}", message);
+    }
 }
