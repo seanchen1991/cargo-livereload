@@ -1,5 +1,3 @@
-extern crate notify;
-
 use std::error;
 use std::io::Write;
 use std::sync::mpsc::channel;
