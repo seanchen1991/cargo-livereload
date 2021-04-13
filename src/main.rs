@@ -1,13 +1,19 @@
 use std::error;
 use std::io::Write;
-use std::sync::mpsc::channel;
+use std::net::SocketAddr;
+use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use structopt::StructOpt;
-use notify::{raw_watcher, RawEvent, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
 use chrono::Local;
 use env_logger::Builder;
+use futures_util::sink::SinkExt;
 use log::LevelFilter;
+use notify::{raw_watcher, RawEvent, RecursiveMode, Watcher};
+use structopt::StructOpt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite;
 
 #[derive(StructOpt)]
 struct Cli {
@@ -15,6 +21,7 @@ struct Cli {
     file_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Clone, Debug)]
 enum FileChangeOperation {
     Chmod = 1,
     CloseWrite,
@@ -26,10 +33,21 @@ enum FileChangeOperation {
     Unknown,
 }
 
+#[derive(Clone, Debug)]
 struct FileChange {
     path: String,
     operation: FileChangeOperation,
 }
+
+type Tx = mpsc::Sender<Vec<FileChange>>;
+
+#[derive(Clone, Debug)]
+struct Client {
+    addr: SocketAddr,
+    tx: Tx,
+}
+
+type Listeners = Arc<Mutex<Vec<Client>>>;
 
 impl From<notify::Op> for FileChangeOperation {
     fn from(source: notify::Op) -> FileChangeOperation {
@@ -55,6 +73,100 @@ impl FileChange {
     }
 }
 
+async fn spawn_filewatcher(
+    tx: broadcast::Sender<Vec<FileChange>>,
+    file_path: String,
+) -> Result<(), Box<dyn error::Error>> {
+    tokio::spawn(async move {
+        let (watcher_tx, watcher_rx) = channel();
+        // let mut watcher = raw_watcher(watcher_tx).map_err(|e| e.to_string())?;
+        let mut watcher = raw_watcher(watcher_tx).expect("Error: Initializing Raw Watcher");
+        // watcher.watch(file_path, RecursiveMode::Recursive).map_err(|e| e.to_string())?;
+        watcher
+            .watch(file_path, RecursiveMode::Recursive)
+            .expect("Error: Watcher");
+        log::info!("File watcher started...");
+
+        let mut changes: Vec<FileChange> = vec![];
+        let mut last_change: Option<Instant> = None;
+
+        loop {
+            match watcher_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(RawEvent {
+                    path: Some(path),
+                    op: Ok(op),
+                    cookie: _cookie,
+                }) => {
+                    changes.push(FileChange::new(op, path.to_str().unwrap().to_string()));
+                }
+                Ok(event) => log::error!("broken event: {:?}", event),
+                Err(e) => match e {
+                    RecvTimeoutError::Timeout => (),
+                    RecvTimeoutError::Disconnected => {
+                        log::error!("Notify disconnected");
+                        break;
+                    }
+                },
+            };
+
+            if changes.len() > 0 {
+                let should_send = match last_change {
+                    Some(t) => Instant::now().duration_since(t) > Duration::from_secs(1),
+                    None => {
+                        last_change = Some(Instant::now());
+                        false
+                    }
+                };
+                if !should_send {
+                    continue;
+                }
+
+                log::info!("Sending changes...");
+                tx.send(changes).unwrap();
+                changes = vec![];
+                last_change = None;
+            }
+        }
+    });
+
+    Ok(())
+}
+
+async fn handle_connection(listeners: Listeners, stream: TcpStream, addr: SocketAddr) {
+    log::info!("Websocket server: got a connection from: {}", addr);
+
+    let mut ws_stream = tokio_tungstenite::accept_async(stream)
+        .await
+        .expect("Error during handshake occurred.");
+
+    log::info!("Websocket server: connection established with {}", addr);
+
+    let (tx, mut rx) = mpsc::channel(10);
+
+    listeners.lock().unwrap().push(Client { addr, tx });
+
+    while let Some(changes) = rx.recv().await {
+        for change in changes {
+            ws_stream
+                .send(tungstenite::Message::Text(change.path))
+                .await
+                .unwrap();
+        }
+    }
+
+    log::info!("Websocket server: {} disconnected", addr);
+}
+
+async fn spawn_websocket(listeners: Listeners) {
+    let listener = TcpListener::bind("127.0.0.1:35729").await.unwrap();
+
+    log::info!("Websocket server listening on 35729");
+
+    while let Ok((stream, addr)) = listener.accept().await {
+        tokio::spawn(handle_connection(listeners.clone(), stream, addr));
+    }
+}
+
 async fn run() -> Result<(), Box<dyn error::Error>> {
     let args = Cli::from_args();
 
@@ -63,36 +175,28 @@ async fn run() -> Result<(), Box<dyn error::Error>> {
         None => ".".to_string(),
     };
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let listeners = Arc::new(Mutex::new(Vec::new()));
 
-    tokio::spawn(async move {
-        let (watcher_tx, watcher_rx) = channel();
-        // let mut watcher = raw_watcher(watcher_tx).map_err(|e| e.to_string())?;
-        let mut watcher = raw_watcher(watcher_tx).expect("Error: Initializing Raw Watcher");
-        // watcher.watch(file_path, RecursiveMode::Recursive).map_err(|e| e.to_string())?;
-        watcher.watch(file_path, RecursiveMode::Recursive).expect("Error: Watcher");
-        log::info!("File watcher started...");
+    let (btx, mut rx): (
+        broadcast::Sender<Vec<FileChange>>,
+        broadcast::Receiver<Vec<FileChange>>,
+    ) = broadcast::channel(10);
 
-        loop {
-            let msg = match watcher_rx.recv() {
-                Ok(RawEvent {
-                    path: Some(path),
-                    op: Ok(op),
-                    cookie,
-                }) => {
-                    format!("{:?} {:?} ({:?})", op, path, cookie)
-                }
-                Ok(event) => format!("broken event: {:?}", event),
-                Err(e) => format!("watch error: {:?}", e),
-            };
-            tx.send(msg).await;
+    // spawns a background task to watch for file changes
+    spawn_filewatcher(btx, file_path).await?;
+
+    // spawns a websocket task to listen for connections
+    tokio::spawn(spawn_websocket(listeners.clone()));
+
+    while let Ok(changes) = rx.recv().await {
+        let listeners = listeners.lock().unwrap();
+
+        // why do I have to use .iter()? Why not just for item in listeners?
+        for listener in listeners.iter() {
+            listener.tx.send(changes.clone()).await.unwrap();
         }
-    });
-
-    while let Some(message) = rx.recv().await {
-        log::info!("Got = {}", message);
     }
-    
+
     Ok(())
 }
 
@@ -110,7 +214,7 @@ pub async fn main() {
         })
         .filter(None, LevelFilter::Info)
         .init();
-    
+
     if let Err(e) = run().await {
         log::error!("Error = {}", e);
     }
