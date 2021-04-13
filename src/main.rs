@@ -138,8 +138,23 @@ async fn handle_connection(listeners: Listeners, stream: TcpStream, addr: Socket
     let mut buf = [0; 100];
     let _len = stream.peek(&mut buf).await.expect("peek failed");
     let bufstr = str::from_utf8(&buf).unwrap();
+    
+    // check `bufstr` for "livereload.js"; serve it up if we get it 
+    // println!("buf: {:?}", bufstr);
+    if bufstr.contains("livereload.js") {
+        let bytes = include_bytes!("../static/livereload.js");
+        let contents = String::from_utf8_lossy(bytes);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            contents.len(),
+            contents,
+        );
 
-    println!("buf: {:?}", bufstr);
+        println!("response: {}", response);
+        
+        // stream.write(response.as_bytes()).expect("Failed to write response");
+        // stream.flush().unwrap();
+    }
 
     // change this to accept HTTP requests as per the livereload protocol 
     // need to serve up the livereload.js script through the same websocket 
@@ -167,6 +182,7 @@ async fn handle_connection(listeners: Listeners, stream: TcpStream, addr: Socket
 }
 
 async fn spawn_websocket(listeners: Listeners) {
+    // TODO: if this panics, kill the whole server 
     let listener = TcpListener::bind("127.0.0.1:35729").await.unwrap();
 
     log::info!("Websocket server listening on 35729");
