@@ -14,6 +14,7 @@ use notify::{raw_watcher, RawEvent, RecursiveMode, Watcher};
 use structopt::StructOpt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite;
 
 #[derive(StructOpt)]
@@ -132,7 +133,7 @@ async fn spawn_filewatcher(
     Ok(())
 }
 
-async fn handle_connection(listeners: Listeners, stream: TcpStream, addr: SocketAddr) {
+async fn handle_connection(listeners: Listeners, mut stream: TcpStream, addr: SocketAddr) {
     log::info!("Websocket server: got a connection from: {}", addr);
 
     let mut buf = [0; 100];
@@ -143,17 +144,18 @@ async fn handle_connection(listeners: Listeners, stream: TcpStream, addr: Socket
     // println!("buf: {:?}", bufstr);
     if bufstr.contains("livereload.js") {
         let bytes = include_bytes!("../static/livereload.js");
-        let contents = String::from_utf8_lossy(bytes);
+        let contents = str::from_utf8(bytes).unwrap();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
             contents.len(),
             contents,
         );
 
-        println!("response: {}", response);
-        
-        // stream.write(response.as_bytes()).expect("Failed to write response");
-        // stream.flush().unwrap();
+        let mut response_bytes = response.as_bytes();
+        stream.write_all(&mut response_bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        return;
     }
 
     // change this to accept HTTP requests as per the livereload protocol 
