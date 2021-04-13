@@ -1,3 +1,4 @@
+use std::str;
 use std::error;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -79,12 +80,11 @@ async fn spawn_filewatcher(
 ) -> Result<(), Box<dyn error::Error>> {
     tokio::spawn(async move {
         let (watcher_tx, watcher_rx) = channel();
-        // let mut watcher = raw_watcher(watcher_tx).map_err(|e| e.to_string())?;
         let mut watcher = raw_watcher(watcher_tx).expect("Error: Initializing Raw Watcher");
-        // watcher.watch(file_path, RecursiveMode::Recursive).map_err(|e| e.to_string())?;
         watcher
             .watch(file_path, RecursiveMode::Recursive)
             .expect("Error: Watcher");
+
         log::info!("File watcher started...");
 
         let mut changes: Vec<FileChange> = vec![];
@@ -135,6 +135,15 @@ async fn spawn_filewatcher(
 async fn handle_connection(listeners: Listeners, stream: TcpStream, addr: SocketAddr) {
     log::info!("Websocket server: got a connection from: {}", addr);
 
+    let mut buf = [0; 100];
+    let _len = stream.peek(&mut buf).await.expect("peek failed");
+    let bufstr = str::from_utf8(&buf).unwrap();
+
+    println!("buf: {:?}", bufstr);
+
+    // change this to accept HTTP requests as per the livereload protocol 
+    // need to serve up the livereload.js script through the same websocket 
+    // or the same tcp stream 
     let mut ws_stream = tokio_tungstenite::accept_async(stream)
         .await
         .expect("Error during handshake occurred.");
@@ -177,6 +186,7 @@ async fn run() -> Result<(), Box<dyn error::Error>> {
 
     let listeners = Arc::new(Mutex::new(Vec::new()));
 
+    // TODO: Change `channel`s to be unbounded channels 
     let (btx, mut rx): (
         broadcast::Sender<Vec<FileChange>>,
         broadcast::Receiver<Vec<FileChange>>,
